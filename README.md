@@ -1,10 +1,10 @@
 # beef-s-bot
-It's probably a bot, made in Python, that can play YouTube music, currently being worked on, and with some bugs
+It's probably a bot, made in Python, that can play YouTube music. It's currently being worked on and has some bugs.
 
-Caso for utilizar, criar um .env utilizando
+If you plan to use it, create a .env file with the following:
 
 DISCORD_TOKEN = ****
 
 BOT_ID = ****
 
-Caso queira hostear no seu proprio computador, por favor instale o ffmpeg, caso não instalado, dará erros
+If you want to host it on your own computer, please install ffmpeg. If it is not installed, it will cause errors.
