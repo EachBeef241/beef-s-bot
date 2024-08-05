@@ -5,7 +5,7 @@ import re
 import math
 from discord import app_commands
 from discord.ext import commands
-from youtube_dl import YoutubeDL
+from yt_dlp import YoutubeDL
 
 URL_REG = re.compile(r'https?://(?:www\.)?.+')
 YOUTUBE_VIDEO_REG = re.compile(r"(https?://)?(www\.)?youtube\.(com|nl)/watch\?v=([-\w]+)")
@@ -23,12 +23,9 @@ class Music(commands.Cog):
     def __init__(self, client):
         self.client = client
 
-        # all the music related stuff
-        self.is_playing = False
-        self.event = asyncio.Event()
-
-        # 2D array containing [song, channel]
-        self.music_queue = []
+        # Armazenar as filas de músicas e conexões por servidor
+        self.music_queues = {}
+        self.voice_clients = {}
         self.YDL_OPTIONS = {
             'format': 'bestaudio/best',
             'restrictfilenames': True,
@@ -41,8 +38,6 @@ class Music(commands.Cog):
             'extract_flat': True
         }
         self.FFMPEG_OPTIONS = {'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
-
-        self.vc = None
 
     async def search_yt(self, item):
         with YoutubeDL(self.YDL_OPTIONS) as ydl:
@@ -75,34 +70,78 @@ class Music(commands.Cog):
 
         return tracks
 
-    async def play_music(self):
-        self.event.clear()
+    async def play_music(self, guild_id):
+        if guild_id not in self.music_queues or guild_id not in self.voice_clients:
+            return
 
-        if len(self.music_queue) > 0:
-            self.is_playing = True
-            m_url = self.music_queue[0][0]['source']
+        music_queue = self.music_queues[guild_id]
+        vc = self.voice_clients[guild_id]
+
+        if len(music_queue) > 0:
+            self.music_queues[guild_id] = music_queue
+            m_url = music_queue[0][0]['source']
 
             with YoutubeDL(self.YDL_OPTIONS) as ydl:
                 try:
                     info = ydl.extract_info(m_url, download=False)
-                    m_url = info['formats'][0]['url']
-                except Exception:
+                    formats = info.get('formats', [])
+
+                    # Encontre o formato de áudio com maior qualidade
+                    m_url = next((f['url'] for f in formats if f.get('acodec') and f['acodec'] != 'none'), None)
+
+                    if not m_url:
+                        # Se nenhum formato com 'acodec' encontrado, busque um URL de áudio
+                        m_url = next((f['url'] for f in formats if f['url']), None)
+
+                    if not m_url:
+                        print("Nenhuma URL de áudio encontrada.")
+                        return False
+
+                    print(f"URL da música: {m_url}")
+
+                except Exception as e:
+                    print(f"Erro ao obter URL da música: {e}")
+                    traceback.print_exc()
                     return False
 
-            if self.vc is None or not self.vc.is_connected():
-                self.vc = await self.music_queue[0][1].connect()
-            else:
-                await self.vc.move_to(self.music_queue[0][1])
+            try:
+                # Conecte ao canal de voz se não estiver conectado
+                if vc is None or not vc.is_connected():
+                    voice_channel = music_queue[0][1]
+                    self.voice_clients[guild_id] = await voice_channel.connect()
+                    vc = self.voice_clients[guild_id]
+                    print("Conectado ao canal de voz.")
+                else:
+                    await vc.move_to(music_queue[0][1])
+                    print("Movido para o canal de voz.")
 
-            self.music_queue.pop(0)
+                music_queue.pop(0)
 
-            self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda l: self.client.loop.call_soon_threadsafe(self.event.set))
-            await self.event.wait()
-            await self.play_music()
+                vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda l: asyncio.run_coroutine_threadsafe(self.play_music(guild_id), self.client.loop))
+                print("Música está tocando.")
+
+                # Verifique se a música começou a tocar
+                await asyncio.sleep(10)  # Atraso de 10 segundos, ajuste se necessário
+
+                if vc.is_playing():
+                    print("Música está tocando corretamente.")
+                else:
+                    print("A música não começou a tocar.")
+
+            except Exception as e:
+                print(f"Erro ao conectar ou reproduzir música: {e}")
+                traceback.print_exc()
+                self.music_queues[guild_id].clear()
+                self.voice_clients.pop(guild_id, None)
+                if vc:
+                    await vc.disconnect()
+
         else:
-            self.is_playing = False
-            self.music_queue.clear()
-            await self.vc.disconnect()
+            if guild_id in self.voice_clients:
+                vc = self.voice_clients.pop(guild_id, None)
+                if vc:
+                    await vc.disconnect()
+            self.music_queues[guild_id].clear()
 
     @app_commands.command(name="ajuda", description="Mostre um comando de ajuda.")
     async def help(self, interaction: discord.Interaction):
@@ -111,7 +150,7 @@ class Music(commands.Cog):
         except discord.errors.NotFound:
             pass
 
-        helptxt = "`/ajuda` - Veja esse guia!\n`/play` - Toque uma música do YouTube!\n`/fila` - Veja a fila de músicas na Playlist\n`/pular` - Pule para a próxima música da fila\n`/sair` - faça o bot sair da call"
+        helptxt = "`/ajuda` - Veja esse guia!\n`/play` - Toque uma música do YouTube!\n`/fila` - Veja a fila de músicas na Playlist\n`/pular` - Pule para a próxima música da fila\n`/sair` - Faça o bot sair da call\n`/pause` - Pause a música atual\n`/resume` - Retome a música pausada"
         embedhelp = discord.Embed(
             colour=1646116,
             title=f'Comandos do {self.client.user.name}',
@@ -135,6 +174,7 @@ class Music(commands.Cog):
             pass
 
         query = busca
+        guild_id = interaction.guild.id
 
         try:
             voice_channel = interaction.user.voice.channel
@@ -145,6 +185,12 @@ class Music(commands.Cog):
             )
             await interaction.followup.send(embed=embedvc)
             return
+
+        if guild_id not in self.music_queues:
+            self.music_queues[guild_id] = []
+
+        if guild_id not in self.voice_clients:
+            self.voice_clients[guild_id] = None
 
         songs = await self.search_yt(query)
         if not songs:
@@ -160,11 +206,11 @@ class Music(commands.Cog):
             )
             for song in songs:
                 embedvc.add_field(name=song['title'], value=f"**Duração:** {song['duration']}", inline=False)
-                self.music_queue.append([song, voice_channel])
+                self.music_queues[guild_id].append([song, voice_channel])
             await interaction.followup.send(embed=embedvc, view=TutorialButton())
 
-            if not self.is_playing:
-                await self.play_music()
+            if not self.voice_clients[guild_id] or not self.voice_clients[guild_id].is_playing():
+                await self.play_music(guild_id)
 
     @app_commands.command(name="fila", description="Mostra as atuais músicas da fila.")
     async def q(self, interaction: discord.Interaction):
@@ -175,22 +221,24 @@ class Music(commands.Cog):
 
         retval = ""
         MAX_SONGS = 10
-        for i in range(0, min(len(self.music_queue), MAX_SONGS)):
-            retval += f'**{i + 1} - **' + self.music_queue[i][0]['title'] + "\n"
+        guild_id = interaction.guild.id
+
+        for i in range(0, min(len(self.music_queues.get(guild_id, [])), MAX_SONGS)):
+            retval += f'**{i + 1}**: ' + self.music_queues[guild_id][i][0]['title'] + "\n"
+
+        if len(self.music_queues.get(guild_id, [])) > MAX_SONGS:
+            retval += f"... e mais {len(self.music_queues[guild_id]) - MAX_SONGS} músicas na fila!"
 
         if retval != "":
             embedvc = discord.Embed(
-                colour=12255232,
+                colour=1646116,
                 description=retval
             )
-            try:
-                await interaction.followup.send(embed=embedvc)
-            except discord.errors.NotFound:
-                pass
+            await interaction.followup.send(embed=embedvc)
         else:
             embedvc = discord.Embed(
-                colour=1646116,
-                description='Não existem músicas na fila no momento.'
+                colour=12255232,
+                description='Nenhuma música na fila no momento.'
             )
             try:
                 await interaction.followup.send(embed=embedvc)
@@ -199,13 +247,15 @@ class Music(commands.Cog):
 
     @app_commands.command(name="pular", description="Pula a atual música que está tocando.")
     async def skip(self, interaction: discord.Interaction):
-        if self.vc and self.vc.is_playing():
-            self.vc.stop()
+        guild_id = interaction.guild.id
+        if guild_id in self.voice_clients and self.voice_clients[guild_id] and self.voice_clients[guild_id].is_playing():
+            self.voice_clients[guild_id].stop()
             embedvc = discord.Embed(
                 colour=1646116,
                 description="Você pulou a música."
             )
             await interaction.followup.send(embed=embedvc)
+            await self.play_music(guild_id)
 
     @app_commands.command(name="sair", description="Faça o bot sair da call")
     async def leave(self, interaction: discord.Interaction):
@@ -215,8 +265,9 @@ class Music(commands.Cog):
             pass
 
         embedvc = discord.Embed(colour=12255232)
+        guild_id = interaction.guild.id
 
-        if not interaction.guild.voice_client:
+        if guild_id not in self.voice_clients or not self.voice_clients[guild_id]:
             embedvc.description = "Não estou conectado em nenhum canal de voz."
             try:
                 await interaction.followup.send(embed=embedvc)
@@ -224,25 +275,11 @@ class Music(commands.Cog):
                 pass
             return
 
-        if not interaction.user.voice or interaction.user.voice.channel != interaction.guild.voice_client.channel:
-            embedvc.description = "Você precisa estar no canal de voz atual para se utilizar desse comando."
-            try:
-                await interaction.followup.send(embed=embedvc)
-            except discord.errors.NotFound:
-                pass
-            return
-
-        if any(m for m in interaction.guild.voice_client.channel.members if not m.bot and m.guild_permissions.manage_channels) and not interaction.user.guild_permissions.manage_channels:
-            embedvc.description = "No momento você não tem permissão para usar esse comando."
-            try:
-                await interaction.followup.send(embed=embedvc)
-            except discord.errors.NotFound:
-                pass
-            return
-
-        self.is_playing = False
-        self.music_queue.clear()
-        await interaction.guild.voice_client.disconnect()
+        self.music_queues.pop(guild_id, None)
+        if guild_id in self.voice_clients:
+            vc = self.voice_clients.pop(guild_id, None)
+            if vc:
+                await vc.disconnect()
 
         embedvc.colour = 1646116
         embedvc.description = "Você parou o player."
@@ -250,6 +287,38 @@ class Music(commands.Cog):
             await interaction.followup.send(embed=embedvc)
         except discord.errors.NotFound:
             pass
+
+    @app_commands.command(name="pause", description="Pause a música atual.")
+    async def pause(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(thinking=True)
+        except discord.errors.NotFound:
+            pass
+
+        guild_id = interaction.guild.id
+        if guild_id in self.voice_clients and self.voice_clients[guild_id] and self.voice_clients[guild_id].is_playing():
+            self.voice_clients[guild_id].pause()
+            embedvc = discord.Embed(
+                colour=1646116,
+                description="Você pausou a música."
+            )
+            await interaction.followup.send(embed=embedvc)
+
+    @app_commands.command(name="resume", description="Retome a música pausada.")
+    async def resume(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(thinking=True)
+        except discord.errors.NotFound:
+            pass
+
+        guild_id = interaction.guild.id
+        if guild_id in self.voice_clients and self.voice_clients[guild_id] and self.voice_clients[guild_id].is_paused():
+            self.voice_clients[guild_id].resume()
+            embedvc = discord.Embed(
+                colour=1646116,
+                description="Você retomou a música."
+            )
+            await interaction.followup.send(embed=embedvc)
 
 async def setup(client):
     await client.add_cog(Music(client))
